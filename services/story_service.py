@@ -185,8 +185,9 @@ def stitch_local(
     """Render the film: clips overlapped with crossfades, music bed, voiceover.
 
     ``clip_paths`` and ``voice_paths`` follow ``plan.segments`` order. Clip
-    audio is dropped; the music is looped/trimmed to the film and ducked under
-    the voiceover, which starts just after each crossfade.
+    audio is dropped except for spoken segments, whose clip carries the
+    on-camera speech. The music is looped/trimmed to the film and ducked under
+    any speech; the voiceover starts just after each crossfade.
     """
     from moviepy import (
         AudioFileClip,
@@ -201,14 +202,21 @@ def stitch_local(
         raise GenerationError("Nothing to stitch: some scenes have no clip.")
     opened = []
     try:
-        sources = [VideoFileClip(p, audio=False) for p in clip_paths]
+        sources = [
+            VideoFileClip(p, audio=seg.spoken)
+            for p, seg in zip(clip_paths, plan.segments)
+        ]
         opened.extend(sources)
         size = sources[0].size
         layers = []
+        speech = []
         for seg, src in zip(plan.segments, sources):
             clip = src.subclipped(
                 seg.trim_head, min(seg.trim_head + seg.duration, src.duration)
             )
+            if seg.spoken and clip.audio is not None:
+                speech.append(clip.audio.with_start(seg.start))
+            clip = clip.without_audio()
             if tuple(clip.size) != tuple(size):
                 clip = clip.resized(new_size=size)
             if seg.fade_in > 0:
@@ -218,7 +226,7 @@ def stitch_local(
         video = CompositeVideoClip(layers, size=size).with_duration(total)
 
         tracks = []
-        has_voice = bool(voice_paths and any(voice_paths))
+        has_voice = bool(voice_paths and any(voice_paths)) or bool(speech)
         if music_path:
             music = AudioFileClip(music_path)
             opened.append(music)
@@ -242,6 +250,7 @@ def stitch_local(
             if voice.duration > room:
                 voice = voice.subclipped(0, room)
             tracks.append(voice.with_start(seg.start + lead))
+        tracks.extend(speech)
         if tracks:
             video = video.with_audio(CompositeAudioClip(tracks).with_duration(total))
         video.write_videofile(
@@ -359,6 +368,11 @@ class MockStoryBackend:
             _MOCK_BEATS[round(i * (len(_MOCK_BEATS) - 1) / max(1, n - 1))]
             for i in range(n)
         ]
+        # Demo stand-in for Gemini's choice of who speaks.
+        talky = ("present", "speech", "interview", "talk", "vlog", "pitch")
+        spoken = story.speech_mode == "on_camera" or (
+            story.speech_mode == "auto" and any(w in story.idea.lower() for w in talky)
+        )
         scenes = []
         for i, (verb, line) in enumerate(beats):
             cam = (
@@ -372,6 +386,7 @@ class MockStoryBackend:
                     "visual": f"The {hero} {verb} in {_MOCK_PLACES[i % len(_MOCK_PLACES)]}, "
                     "same outfit and face as before, soft cinematic light.",
                     "camera": cam,
+                    "spoken": spoken,
                 }
             )
         first = re.split(r"[.,;:!?]| and | who | that ", story.idea.strip())[0].strip()
@@ -381,7 +396,8 @@ class MockStoryBackend:
                 break
             title = f"{title} {w}".strip()
         title = (title or "Untitled story")[0].upper() + (title or "Untitled story")[1:]
-        return json.dumps({"title": title, "scenes": scenes})
+        voice = "a warm, confident voice, mid-30s" if spoken else ""
+        return json.dumps({"title": title, "voice": voice, "scenes": scenes})
 
     def rewrite_scene(self, story: Story, index: int) -> str:
         self._sleep(1.0, 1.8)
@@ -698,7 +714,9 @@ class VertexStoryBackend:
                 aspect_ratio=story.aspect_ratio,
                 resolution=caps.resolution,
                 enhance_prompt=True,
-                generate_audio=False,
+                # Spoken scenes: Veo renders the line with lip sync. Other
+                # clips stay silent under the music and voiceover.
+                generate_audio=bool(scene.spoken and scene.narration.strip()),
                 model_version_id=self.cfg.STORY_VEO_MODEL_VERSION,
                 person_generation="Allow (Adults only)",
                 reference_image_gcs=start_frame_uri or None,
